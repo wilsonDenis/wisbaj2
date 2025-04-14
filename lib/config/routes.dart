@@ -16,7 +16,7 @@ class AppRouter {
         return MaterialPageRoute(builder: (_) => const HomePage());
       case connection:
         return MaterialPageRoute(builder: (_) => const ConnectionPage());
-      case addAlarm:
+        case addAlarm:
         return MaterialPageRoute(builder: (_) => const AddAlarmPage());
       case alarmDetails:
         final args = settings.arguments as Map<String, dynamic>;

@@ -1,4 +1,3 @@
-// BluetoothManager.dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
@@ -19,6 +18,8 @@ class BluetoothManager {
       StreamController<ConnectionStatus>.broadcast();
   final StreamController<List<BluetoothDevice>> _devicesController =
       StreamController<List<BluetoothDevice>>.broadcast();
+  final StreamController<Map<String, dynamic>> _arduinoResponseController =
+      StreamController<Map<String, dynamic>>.broadcast();
 
   BluetoothDevice? _connectedDevice;
   BluetoothConnection? _connection;
@@ -31,6 +32,8 @@ class BluetoothManager {
   Stream<ConnectionStatus> get connectionStatus =>
       _connectionStatusController.stream;
   Stream<List<BluetoothDevice>> get devices => _devicesController.stream;
+  Stream<Map<String, dynamic>> get arduinoResponses =>
+      _arduinoResponseController.stream;
 
   ConnectionStatus _status = ConnectionStatus.disconnected;
   ConnectionStatus get status => _status;
@@ -51,16 +54,13 @@ class BluetoothManager {
 
         if (state == BluetoothState.STATE_ON) {
           _logger.i('Bluetooth est maintenant activé.');
-
           if (_status == ConnectionStatus.disconnected ||
               _status == ConnectionStatus.error) {
             _updateConnectionStatus(ConnectionStatus.initialized);
           }
         } else if (state == BluetoothState.STATE_OFF) {
           _logger.w('Bluetooth est maintenant désactivé.');
-
           _updateConnectionStatus(ConnectionStatus.disconnected);
-
           _disconnectCurrentDevice();
         }
       });
@@ -196,6 +196,14 @@ class BluetoothManager {
                 _connection!.input!.listen((Uint8List data) {
               String message = utf8.decode(data);
               _logger.i('📥 Données reçues: $message');
+
+              try {
+                Map<String, dynamic> response = jsonDecode(message);
+                _logger.i('📊 Réponse JSON de l\'Arduino: $response');
+                _arduinoResponseController.add(response);
+              } catch (e) {
+                _logger.w('⚠️ Réception de données non-JSON: $message');
+              }
             }, onDone: () {
               _logger.w('⚠️ Connexion fermée par l\'appareil distant');
               _updateConnectionStatus(ConnectionStatus.disconnected);
@@ -242,7 +250,7 @@ class BluetoothManager {
     }
 
     try {
-      Uint8List bytes = Uint8List.fromList(utf8.encode(data));
+      Uint8List bytes = Uint8List.fromList(utf8.encode("$data\n"));
 
       _logger.i('📤 Envoi de données: $data');
       _connection!.output.add(bytes);
@@ -257,6 +265,85 @@ class BluetoothManager {
 
   Future<bool> sendAlarm(String alarmData) async {
     return sendData(alarmData);
+  }
+
+  Future<bool> sendJsonAlarm(List<Map<String, dynamic>> horaires,
+      {String? heure, int? duree}) async {
+    try {
+      final Map<String, dynamic> jsonData = {
+        'horaires': horaires,
+      };
+
+      if (heure != null) {
+        // Extraire les parties de l'heure
+        List<String> parts = heure.split(':');
+        if (parts.length == 2) {
+          int hour = int.parse(parts[0]);
+          int minute = int.parse(parts[1]);
+          // Reformater avec les zéros initiaux
+          jsonData['heure'] =
+              '${hour.toString().padLeft(2, '0')}:${minute.toString().padLeft(2, '0')}';
+        } else {
+          jsonData['heure'] = heure;
+        }
+      }
+
+      if (duree != null) jsonData['duree'] = duree;
+
+      final String jsonString = jsonEncode(jsonData);
+
+      _logger.i('📤 Envoi d\'alarme au format JSON: $jsonString');
+
+      bool success = await sendData(jsonString);
+      if (!success) {
+        return false;
+      }
+
+      _logger.i('⏳ Attente de la confirmation de l\'Arduino...');
+
+      try {
+        Completer<bool> responseCompleter = Completer<bool>();
+
+        late StreamSubscription subscription;
+        subscription = arduinoResponses.listen((response) {
+          if (response.containsKey('status')) {
+            String status = response['status'];
+            if (status == 'received' || status == 'configured') {
+              if (!responseCompleter.isCompleted) {
+                responseCompleter.complete(true);
+              }
+              subscription.cancel();
+            } else if (status == 'error') {
+              if (!responseCompleter.isCompleted) {
+                responseCompleter.complete(false);
+              }
+              subscription.cancel();
+            }
+          }
+        });
+
+        bool received = await responseCompleter.future
+            .timeout(const Duration(seconds: 3), onTimeout: () {
+          _logger.w('⚠️ Timeout en attente de confirmation de l\'Arduino');
+          subscription.cancel();
+          return false;
+        });
+
+        if (received) {
+          _logger.i('✅ Confirmation reçue de l\'Arduino');
+        } else {
+          _logger.w('⚠️ Pas de confirmation valide reçue');
+        }
+
+        return received;
+      } catch (e) {
+        _logger.e('❌ Erreur en attendant la confirmation: $e');
+        return false;
+      }
+    } catch (e) {
+      _logger.e('❌ Erreur lors de la construction du JSON d\'alarme: $e');
+      return false;
+    }
   }
 
   Future<void> _disconnectCurrentDevice() async {
@@ -274,31 +361,6 @@ class BluetoothManager {
 
     _connectedDevice = null;
     _connection = null;
-  }
-
-  Future<bool> sendJsonAlarm(List<Map<String, dynamic>> horaires,
-      {String? heure, int? duree}) async {
-    try {
-      // Construction du JSON dans le format attendu par l'Arduino
-      final Map<String, dynamic> jsonData = {
-        'horaires': horaires,
-      };
-
-      // Ajout des propriétés globales si fournies
-      if (heure != null) jsonData['heure'] = heure;
-      if (duree != null) jsonData['duree'] = duree;
-
-      // Conversion en chaîne JSON
-      final String jsonString = jsonEncode(jsonData);
-
-      _logger.i('📤 Envoi d\'alarme au format JSON: $jsonString');
-
-      // Utilisation de la méthode existante pour envoyer les données
-      return await sendData(jsonString);
-    } catch (e) {
-      _logger.e('❌ Erreur lors de la construction du JSON d\'alarme: $e');
-      return false;
-    }
   }
 
   Future<void> disconnect() async {
@@ -319,5 +381,6 @@ class BluetoothManager {
     _disconnectCurrentDevice();
     _connectionStatusController.close();
     _devicesController.close();
+    _arduinoResponseController.close();
   }
 }
